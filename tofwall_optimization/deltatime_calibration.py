@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
-# =============================================================================
-# DELTATIME_CALIBRATION.PY — Calibrazione dt->posizione (v, offset per barra),
-# standalone: da hits.pkl (+ opzionalmente points.pkl) al file .txt di output.
-#
-# Fit a DUE STADI, per barra:
-#   1. per ciascuna delle 20 posizioni nominali, fit gaussiano della
-#      distribuzione dei dt (mu, dmu) — saltata se ha meno di
-#      MIN_POINTS_PER_POSITION eventi
-#   2. fit lineare PESATO mu(pos) = A*pos + B sui punti (pos, mu, dmu) del
-#      passo 1 -> v = 2/A, offset = -B/A
-#
-# --hits è sempre obbligatorio. --points è opzionale:
-#   - CON --points: matching preciso via point SHOE (row/column), con i due
-#     filtri di sicurezza per escludere — barre riusate nello stesso evento,
-#     E Z mismatch tra row e column (qui lo Z è affidabile perché viene dal point,
-#     tenuto per sicurezza).
-#   - SENZA --points: pairing diretto sugli hit per evento — un evento
-#     contribuisce solo se ha ESATTAMENTE un hit rear (bar_id 0-19) e un hit
-#     front (bar_id 20-39), altrimenti è ambiguo e viene scartato. NESSUN
-#     controllo di coerenza Z in questa modalità (non richiesto).
-# =============================================================================
-#
-# Uso:
-#   python3 deltatime_calibration.py --hits hits.pkl [--points points.pkl] \
-#       --output-dir <cartella_output> [--plot-bar N1 N2 ...]
-#   python3 deltatime_calibration.py --hits /home/ubuntu_leo/FOOT/bars/shoe_twscan_hits.pkl
-#       --output-dir /home/ubuntu_leo/FOOT/calib --plot-bar 7 30
-# =============================================================================
+"""
+deltatime_calibration.py — Calibration of the position along the bar from the
+time difference of the two ends, dt = t_R - t_L: velocity v and offset per bar,
+
+    x = v * dt / 2 + offset
+
+For each bar, the reference position of a hit is the centre of the crossing
+bar of the other layer. Two-stage fit:
+    1. for each nominal position, gaussian fit of the dt distribution -> mu, dmu
+       (positions with fewer than MIN_POINTS_PER_POSITION entries are skipped)
+    2. weighted linear fit mu(x) = A*x + B, excluding the two outermost
+       positions (bar edges) -> v = 2/A, offset = -B/A, with the full error
+       propagation (covariance of A and B included)
+
+Matching between the two layers:
+    with --points  through the SHOE points (row, column); the two hits must have
+                   the same Z; bars shared by more points in the same event are
+                   discarded (--event-filter)
+    hits only      events with exactly one rear hit (bar_id 0-19) and one front
+                   hit (bar_id 20-39); no Z check
+
+Output in --output-dir:
+    deltatime_calibration_<tag>.txt   v, dv, offset, doffset for every fitted bar
+    deltatime_calibration_<tag>.map   same format as TATWdeltaTimeMap.map
+                                      (written only if all 40 bars are fitted)
+
+Usage:
+    python3 deltatime_calibration.py --hits hits.pkl [--points points.pkl] --output-dir DIR
+                                     [--tag physics_z2] [--z 2] [--plot-bar 7 30]
+"""
 
 import os
 import sys
@@ -38,7 +40,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-PLOT_PER_POSITION = True   # True: con --plot-bar mostra anche l'istogramma dt di ogni posizione
+PLOT_PER_POSITION = True   # with --plot-bar, also show the dt histogram of every position
 
 plt.rcParams.update({
     "font.size": 16,
@@ -50,34 +52,33 @@ plt.rcParams.update({
 })
 
 # =============================================================================
-# GEOMETRIA DELLE BARRE - da TATWdetector.geo (CNAO2025)
+# BAR CENTRES (cm), TATWdetector.geo (CNAO2025)
 # =============================================================================
 
-# Layer 0 (vertical/column/rear): PositionX = "indirizzo" fisso della barra
+# layer 0 (rear, vertical bars, column): x
 LAYER0_X = {i: 19.0 - 2.0 * i for i in range(20)}
-# Layer 1 (horizontal/row/front): PositionY = "indirizzo" fisso della barra
+# layer 1 (front, horizontal bars, row): y
 LAYER1_Y = {i: 19.0 - 2.0 * i for i in range(20)}
 
 # =============================================================================
-# CARICAMENTO
+# INPUT
 # =============================================================================
 
 def load_pkl(path, key):
     with open(path, "rb") as f:
         payload = pickle.load(f)
     items = payload[key]
-    print(f"{key.capitalize()} caricati: {len(items)}")
+    print(f"{key.capitalize()} loaded: {len(items)}")
     print(f"  runs={payload.get('runs', '?')}")
     return items
 
 
 # =============================================================================
-# INDICE HIT — per lookup O(1) nel matching via point
+# HIT INDEX
 # =============================================================================
 
 def build_hit_index(hits):
-    """Costruisce un dizionario: Chiave -> indice (run_id, eventN, bar_id), Valore -> hit.
-    Un solo hit per barra per evento per costruzione (vedi TATWactNtuHit) — verifica comunque."""
+    """{(run_id, eventN, bar_id): hit}. SHOE has one hit per bar per event; duplicates are reported."""
     idx = {}
     n_collisions = 0
     for h in hits:
@@ -88,24 +89,23 @@ def build_hit_index(hits):
         idx[key] = h
 
     if n_collisions > 0:
-        print(f"[ATTENZIONE] {n_collisions} collisioni nell'indice hit "
-              f"(stessa run/evento/bar_id per più hit) — verifica il dataset.")
+        print(f"[WARNING] {n_collisions} hits with the same run/event/bar_id (only the first is used)")
     else:
-        print(f"Indice hit costruito: {len(idx)} chiavi uniche, nessuna collisione.")
+        print(f"Hit index: {len(idx)} unique keys.")
     return idx
 
 
 # =============================================================================
-# MODALITÀ 1 — match via point (hits + points) — con controllo Z
+# MATCHING THROUGH THE POINTS
 # =============================================================================
 
 def build_calibration_data_from_points(points, hits, z_filter=None, event_filter="bar-reuse"):
     """
-    ...
-    event_filter: 'bar-reuse' (default) scarta solo le barre condivise da più
-    point nello stesso evento (il più chirurgico); 'single-point' scarta
-    l'intero evento se ha più di un point (più severo, butta via anche dati
-    non ambigui); 'none' non applica nessun filtro di ambiguità.
+    {bar_id: [(dt, reference position), ...]} from the points, requiring the
+    same Z for the two hits (and Z = z_filter, if given).
+    event_filter: "bar-reuse" discards the points with a bar shared by another
+    point of the same event; "single-point" discards the events with more than
+    one point; "none" applies no ambiguity selection.
     """
     hit_idx = build_hit_index(hits)
     data = {bid: [] for bid in range(40)}
@@ -134,7 +134,6 @@ def build_calibration_data_from_points(points, hits, z_filter=None, event_filter
             if event_point_count[(run_id, evN)] > 1:
                 n_reused += 1
                 continue
-        # event_filter == "none": nessun controllo di ambiguità
 
         h_col = hit_idx.get((run_id, evN, col_bar_id))
         h_row = hit_idx.get((run_id, evN, row_bar_id))
@@ -156,22 +155,20 @@ def build_calibration_data_from_points(points, hits, z_filter=None, event_filter
         dt_row = h_row["t_R"] - h_row["t_L"]
         data[row_bar_id].append((dt_row, LAYER0_X[p["column"]]))
 
-    print(f"Point processati: {len(points)}, mancava hit: {n_missing}, "
-          f"Z mismatch: {n_z_mismatch}, Z filtrati (--z={z_filter}): {n_z_filtered}, "
-          f"scartati per ambiguità ({event_filter}): {n_reused}")
+    print(f"Points: {len(points)}, missing hit: {n_missing}, "
+          f"Z mismatch: {n_z_mismatch}, other Z (--z={z_filter}): {n_z_filtered}, "
+          f"ambiguous ({event_filter}): {n_reused}")
     return data
 
 
 # =============================================================================
-# MODALITÀ 2 — match diretto sugli hit (senza points) — SENZA controllo Z
+# MATCHING ON THE HITS ONLY
 # =============================================================================
 
 def build_calibration_data_from_hits_only(hits):
     """
-    Raggruppa gli hit per (run_id, eventN); tiene solo gli eventi con
-    ESATTAMENTE un hit rear (bar_id 0-19) e un hit front (bar_id 20-39) —
-    nessun tentativo di disambiguazione se ce ne sono di più per lato.
-    Nessun controllo di coerenza Z (non disponibile/non richiesto qui).
+    {bar_id: [(dt, reference position), ...]} from the events with exactly one
+    rear hit (bar_id 0-19) and one front hit (bar_id 20-39). No Z check.
     """
     by_event = defaultdict(lambda: {"rear": [], "front": []})
     for h in hits:
@@ -196,11 +193,11 @@ def build_calibration_data_from_hits_only(hits):
             n_ambiguous += 1
             continue
 
-        h_col = rear_hits[0]   # column = rear
-        h_row = front_hits[0]  # row = front
+        h_col = rear_hits[0]
+        h_row = front_hits[0]
 
-        col_local = h_col["bar_id"]            # 0-19
-        row_local = h_row["bar_id"] - 20       # 0-19
+        col_local = h_col["bar_id"]
+        row_local = h_row["bar_id"] - 20
 
         dt_col = h_col["t_R"] - h_col["t_L"]
         data[h_col["bar_id"]].append((dt_col, LAYER1_Y[row_local]))
@@ -210,27 +207,24 @@ def build_calibration_data_from_hits_only(hits):
 
         n_paired += 1
 
-    print(f"Eventi totali: {n_events}; senza hit su un lato: {n_zero_side}; "
-          f"ambigui (>1 hit su un lato): {n_ambiguous}; accoppiati con successo: {n_paired}")
+    print(f"Events: {n_events}; without hits on one layer: {n_zero_side}; "
+          f"ambiguous (>1 hit on one layer): {n_ambiguous}; paired: {n_paired}")
     return data
 
 
 # =============================================================================
-# PLOT PRELIMINARE — scatter grezzo (dt, posizione_nota), nessun fit
+# CHECK PLOT
 # =============================================================================
 
 def plot_deltatime_scatter_raw(bar_data, bar_id, label="", z_filter=None):
-    """
-    Scatter grezzo di tutte le coppie (dt, posizione_nota) di una barra,
-    senza nessun fit sovrapposto — controllo visivo preliminare
-    """
+    """All the (dt, reference position) pairs of one bar."""
     dt_arr = np.array([x[0] for x in bar_data])
     pos_arr = np.array([x[1] for x in bar_data])
 
     fig, ax = plt.subplots(figsize=(9, 6))
     ax.scatter(dt_arr, pos_arr, s=4, alpha=0.3, color="steelblue")
     ax.set_xlabel(r"$\Delta$t (ns)", fontsize=14)
-    ax.set_ylabel("Posizione nominale (cm)", fontsize=14)
+    ax.set_ylabel("Nominal position (cm)", fontsize=14)
     z_str = f"Z={z_filter}" if z_filter is not None else ""
     ax.set_title(f"Scatter plot — Bar {bar_id} ({label}) — {z_str} — {len(bar_data)} entries", fontsize=14)
     ax.tick_params(axis='both', labelsize=14)
@@ -240,12 +234,13 @@ def plot_deltatime_scatter_raw(bar_data, bar_id, label="", z_filter=None):
 
 
 # =============================================================================
-# STADIO 1 — fit gaussiano della distribuzione dt per ciascuna posizione nominale
+# STAGE 1 — gaussian fit of the dt distribution at each nominal position
 # =============================================================================
 
-# binning robusto per il fit gaussiano di ogni posizione 
-BINS_PER_SIGMA = 4        # quando ho molta statistica: da aumentare se vedo la forma a "pettine"
-MIN_COUNTS_PER_BIN = 12   # quando ho poca statistica: da aumentare per avere bin più larghi
+# histogram binning: bin width = sigma/BINS_PER_SIGMA, but at least
+# MIN_COUNTS_PER_BIN entries per bin on average
+BINS_PER_SIGMA = 4
+MIN_COUNTS_PER_BIN = 12
 N_SIGMA_RANGE = 4.0
 N_SIGMA_FIT = 2.0
 
@@ -255,9 +250,9 @@ def gauss(x, amp, mu, sigma):
 def _fit_gauss_dt(dt_values, bins_per_sigma=BINS_PER_SIGMA, min_counts_per_bin=MIN_COUNTS_PER_BIN,
                    n_sigma_range=N_SIGMA_RANGE, n_sigma_fit=N_SIGMA_FIT):
     """
-    Fit gaussiano su un array di dt, con binning che si adatta sia alla vera
-    scala della distribuzione (sigma, stimata via MAD) sia alla statistica
-    disponibile — stessa logica già validata per sigma_TOF.
+    Gaussian fit of the histogram of dt_values within ±N_SIGMA_FIT sigma of the
+    peak; sigma first estimated from the MAD, binning adapted to both sigma and
+    the number of entries. Returns {"mu", "dmu", "sigma", "n", "popt", "rng", "bins"} or None.
     """
     dt_values = np.asarray(dt_values)
     dt_values = dt_values[np.isfinite(dt_values)]
@@ -296,17 +291,14 @@ def _fit_gauss_dt(dt_values, bins_per_sigma=BINS_PER_SIGMA, min_counts_per_bin=M
         return None
 
 
-MIN_POINTS_PER_POSITION = 100   # sotto questa statistica, la posizione viene saltata (stadio 1)
+MIN_POINTS_PER_POSITION = 100
 
 def fit_dt_distribution_per_position(bar_data, min_points=MIN_POINTS_PER_POSITION,
                                       plot=False, bar_id=None, label="", z_filter=None):
     """
-    Raggruppa le coppie (dt, pos_nota) per posizione nominale, fitta la
-    distribuzione dei dt per ciascuna posizione con una gaussiana (via
-    _fit_gauss_dt). Posizioni con meno di min_points eventi vengono saltate.
-    Ritorna la lista dei fit riusciti: [{pos, mu, dmu, sigma, n}, ...]
-    mu(pos) = A·pos + B, v=2/A, offset=-B/A, con propagazione dell'errore completa,
-    inclusa la covarianza tra A e B, necessaria perché non sono stime indipendenti
+    Gaussian fit of the dt distribution at each nominal position (positions with
+    fewer than min_points entries are skipped).
+    Returns [{"pos", "mu", "dmu", "sigma", "n"}, ...].
     """
     by_pos = defaultdict(list)
     for dt, pos in bar_data:
@@ -317,12 +309,12 @@ def fit_dt_distribution_per_position(bar_data, min_points=MIN_POINTS_PER_POSITIO
         dt_values = np.array(by_pos[pos])
 
         if len(dt_values) < min_points:
-            print(f"    pos={pos:+.1f} cm: solo {len(dt_values)} punti (< {min_points}), skip")
+            print(f"    pos={pos:+.1f} cm: {len(dt_values)} entries (< {min_points}), skipped")
             continue
 
         fit = _fit_gauss_dt(dt_values)
         if fit is None:
-            print(f"    pos={pos:+.1f} cm: fit gaussiano fallito, skip")
+            print(f"    pos={pos:+.1f} cm: gaussian fit failed, skipped")
             continue
 
         print(f"    pos={pos:+.1f} cm: mu_dt={fit['mu']:.4f}±{fit['dmu']:.4f} ns, "
@@ -337,13 +329,11 @@ def fit_dt_distribution_per_position(bar_data, min_points=MIN_POINTS_PER_POSITIO
                     label=fr"$\mu_{{\Delta t}} = {fit['mu']:.3f} \pm {fit['dmu']:.3f}$ ns")
             ax.set_xlabel(r"$\Delta t$ (ns)")
             ax.set_ylabel("Counts")
-            z_str = f"Z={z_filter}" if z_filter is not None else ""
             ax.set_title(fr"Bar {bar_id} ({label}) — $x_{{\mathrm{{nom}}}}$ = {pos:+.1f} cm — {fit['n']} entries")
             ax.tick_params(axis='both')
             ax.legend()
             ax.grid(True, alpha=0.3)
             plt.tight_layout()
-            #plt.close(fig)
             plt.show()
 
         pos_results.append({"pos": pos, "mu": fit["mu"], "dmu": fit["dmu"],
@@ -353,16 +343,15 @@ def fit_dt_distribution_per_position(bar_data, min_points=MIN_POINTS_PER_POSITIO
 
 
 # =============================================================================
-# STADIO 2 — fit lineare pesato mu(pos) = A*pos + B -> v, offset
+# STAGE 2 — weighted linear fit mu(pos) = A*pos + B -> v, offset
 # =============================================================================
 
 def fit_v_offset_from_positions(pos_results):
     """
-    Fit lineare PESATO (con dmu come errore sulla y) sui punti (pos, mu, dmu)
-    prodotti dallo stadio 1. Converte A,B -> v=2/A, offset=-B/A, con
-    propagazione dell'errore (inclusa la covarianza tra A e B).
+    Weighted linear fit of the stage-1 points, without the two outermost
+    positions; v = 2/A, offset = -B/A with the covariance of A and B in the
+    error propagation.
     """
-
     pos_results_sorted = sorted(pos_results, key=lambda p: p["pos"])
     pos_arr = np.array([p["pos"] for p in pos_results_sorted])[1:-1]
     mu_arr = np.array([p["mu"] for p in pos_results_sorted])[1:-1]
@@ -375,7 +364,7 @@ def fit_v_offset_from_positions(pos_results):
         popt, pcov = curve_fit(linfunc, pos_arr, mu_arr, sigma=dmu_arr,
                                absolute_sigma=True, p0=[2 / 15.5, 0.0])
     except Exception as e:
-        print(f"    Fit finale (stadio 2) fallito: {e}")
+        print(f"    Stage-2 fit failed: {e}")
         return None
 
     A, B = popt
@@ -399,6 +388,7 @@ def fit_v_offset_from_positions(pos_results):
 
 
 def plot_v_offset_summary(fit2, bar_id, label="", z_filter=None):
+    """Stage-2 fit of one bar with the normalised residuals."""
     pos_arr, mu_arr, dmu_arr = fit2["pos_arr"], fit2["mu_arr"], fit2["dmu_arr"]
     linfunc = fit2["linfunc"]
 
@@ -411,13 +401,12 @@ def plot_v_offset_summary(fit2, bar_id, label="", z_filter=None):
     ax.plot(pos_fit, linfunc(pos_fit, *fit2["popt"]), color="black", lw=2,
             label=f"v = {fit2['v']:.3f}±{fit2['dv']:.3f} cm/ns,  offset = {fit2['offset']:.3f}±{fit2['doffset']:.3f} cm")
     ax.set_ylabel(fr"$\mu_{{\Delta t}}$ (ns)")
-    z_str = f"Z={z_filter}" if z_filter is not None else ""
-    ax.set_title(fr"Bar {bar_id} ({label}) — Physics data ($Z=2$) — {fit2['n_positions']} positions")
+    z_str = f" — $Z={z_filter}$" if z_filter is not None else ""
+    ax.set_title(fr"Bar {bar_id} ({label}){z_str} — {fit2['n_positions']} positions")
     ax.tick_params(axis='both')
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- residui NORMALIZZATI (pull = residuo/dmu), neri, uniti da linea tratteggiata nera ---
     residuals = mu_arr - linfunc(pos_arr, *fit2["popt"])
     residuals_norm = residuals / dmu_arr
 
@@ -433,11 +422,11 @@ def plot_v_offset_summary(fit2, bar_id, label="", z_filter=None):
 
 
 # =============================================================================
-# OUTPUT — file .txt, formato SHOE (bar_id, layer, barId(Shoe), v, offset)
-# esteso con gli errori su v e offset, stessa precisione numerica (.6f)
+# OUTPUT
 # =============================================================================
 
 def write_calibration_file(results, out_path):
+    """Same columns as TATWdeltaTimeMap.map, plus the errors on v and offset."""
     lines = ["#barId  layer   barId(Shoe)     v [cm/ns]   dv [cm/ns]      dx|y_AB [cm]   d(dx|y_AB) [cm]"]
     for bar_id in sorted(results.keys()):
         layer = 0 if bar_id < 20 else 1
@@ -448,14 +437,13 @@ def write_calibration_file(results, out_path):
 
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"\n[INFO] File di calibrazione salvato in: {out_path}")
+    print(f"\n[INFO] Calibration saved to: {out_path}")
 
 def write_shoe_map(results, out_path):
-    """File nel formato di TATWdeltaTimeMap.map di SHOE: 40 righe
-    'barId:  layer  barId(Shoe)  v  offset', senza errori, stessa precisione (.6f)."""
+    """File in the format of TATWdeltaTimeMap.map (SHOE): 40 lines 'barId: layer barId(Shoe) v offset'."""
     missing = [b for b in range(40) if b not in results]
     if missing:
-        print(f"\n[ERRORE] Barre senza fit {missing}: .map NON scritto (SHOE richiede tutte e 40 le barre).")
+        print(f"\n[WARNING] Bars without fit {missing}: .map not written (SHOE needs all 40 bars).")
         return
 
     lines = ["#barId  layer   barId(Shoe)     v [cm/ns]       dx|y_AB [cm]"]
@@ -467,7 +455,7 @@ def write_shoe_map(results, out_path):
 
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"[INFO] Mappa in formato SHOE salvata in: {out_path}")
+    print(f"[INFO] SHOE map saved to: {out_path}")
 
 
 # =============================================================================
@@ -475,21 +463,17 @@ def write_shoe_map(results, out_path):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Calibrazione dt->posizione (fit a due stadi), standalone")
-    parser.add_argument("--hits", required=True, help="Percorso al file hits.pkl (chiave 'hits')")
+    parser = argparse.ArgumentParser(description="Delta-time -> position calibration (two-stage fit)")
+    parser.add_argument("--hits", required=True, help="hits.pkl from extract_shoe.py (--hits or --hits-dt)")
     parser.add_argument("--points", default=None,
-                        help="Percorso al file points.pkl (opzionale, chiave 'points') — "
-                             "se assente, il matching viene fatto direttamente sugli hit, senza controllo Z")
-    parser.add_argument("--output-dir", required=True, help="Cartella dove salvare il file .txt")
+                        help="points.pkl from extract_shoe.py; without it the hits are paired directly")
+    parser.add_argument("--output-dir", required=True, help="Output folder")
+    parser.add_argument("--tag", default="physics", help="Suffix of the output files")
     parser.add_argument("--plot-bar", type=int, nargs="+", default=None,
-                        help="Lista di bar_id per cui mostrare i plot di debug "
-                             "(scatter grezzo + istogramma dt per ogni posizione + riepilogo v/offset)")
-    parser.add_argument("--z", type=int, default=None,
-                    help="Filtra per uno specifico Z ricostruito (solo con --points; default: nessun filtro, prende tutti gli Z)")
+                        help="Bars for the check plots (scatter, dt per position, stage-2 fit)")
+    parser.add_argument("--z", type=int, default=None, help="Only hits with this Z (with --points)")
     parser.add_argument("--event-filter", choices=["bar-reuse", "single-point", "none"], default="bar-reuse",
-                    help="Filtro di ambiguità nel matching via point: 'bar-reuse' (default, scarta solo "
-                         "le barre condivise), 'single-point' (scarta l'intero evento se ha più di un "
-                         "point), 'none' (nessun filtro di ambiguità)")
+                        help="Ambiguity selection with --points (default: bar-reuse)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -498,10 +482,10 @@ def main():
 
     if args.points:
         points = load_pkl(args.points, "points")
-        print(f"\n[INFO] Modalità: matching via point (con controllo Z, filtro ambiguità: {args.event_filter})")
+        print(f"\n[INFO] Matching through the points (Z check, ambiguity selection: {args.event_filter})")
         data = build_calibration_data_from_points(points, hits, z_filter=args.z, event_filter=args.event_filter)
     else:
-        print("\n[INFO] Modalità: matching diretto sugli hit (nessun controllo Z)")
+        print("\n[INFO] Matching on the hits only (no Z check)")
         data = build_calibration_data_from_hits_only(hits)
 
     plot_bars = set(args.plot_bar) if args.plot_bar else set()
@@ -513,25 +497,22 @@ def main():
             continue
 
         label = "rear" if bar_id < 20 else "front"
-        print(f"\n{'─'*55}\nBar {bar_id} ({label}) — {len(bar_data)} coppie (dt, pos) totali")
+        print(f"\n{'─'*55}\nBar {bar_id} ({label}) — {len(bar_data)} (dt, position) pairs")
 
-        # --- plot preliminare: scatter grezzo, nessun fit ---
         if bar_id in plot_bars:
             plot_deltatime_scatter_raw(bar_data, bar_id, label, z_filter=args.z)
 
-        # --- stadio 1: fit gaussiano per ciascuna posizione ---
         pos_results = fit_dt_distribution_per_position(
             bar_data, plot=(PLOT_PER_POSITION and bar_id in plot_bars), bar_id=bar_id, label=label, z_filter=args.z)
 
-        # --- stadio 2: fit lineare pesato sui (pos, mu, dmu) ---
         fit2 = fit_v_offset_from_positions(pos_results)
         if fit2 is None:
-            print("  Fit finale (stadio 2) fallito, barra saltata.")
+            print("  Stage-2 fit failed, bar skipped.")
             continue
 
-        print(f"  RISULTATO: v={fit2['v']:.4f}±{fit2['dv']:.4f} cm/ns, "
+        print(f"  RESULT: v={fit2['v']:.4f}±{fit2['dv']:.4f} cm/ns, "
               f"offset={fit2['offset']:.4f}±{fit2['doffset']:.4f} cm, "
-              f"posizioni usate={fit2['n_positions']}, chi2/ndof={fit2['chi2']:.1f}/{fit2['ndof']}")
+              f"positions={fit2['n_positions']}, chi2/ndof={fit2['chi2']:.1f}/{fit2['ndof']}")
 
         results[bar_id] = fit2
 
@@ -539,14 +520,11 @@ def main():
             plot_v_offset_summary(fit2, bar_id, label, z_filter=args.z)
 
     if not results:
-        print("\n[ERRORE] Nessuna barra processata con successo, nessun file salvato.")
+        print("\n[ERROR] No bar fitted, nothing saved.")
         sys.exit(1)
 
-    out_path = os.path.join(args.output_dir, "deltatime_calibration_physics_z2.txt")
-    write_calibration_file(results, out_path)
-
-    map_path = os.path.join(args.output_dir, "deltatime_calibration_phyisics_z2.map")
-    write_shoe_map(results, map_path)
+    write_calibration_file(results, os.path.join(args.output_dir, f"deltatime_calibration_{args.tag}.txt"))
+    write_shoe_map(results, os.path.join(args.output_dir, f"deltatime_calibration_{args.tag}.map"))
 
 
 if __name__ == "__main__":

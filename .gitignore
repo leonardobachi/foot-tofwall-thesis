@@ -1,0 +1,15 @@
+# data and outputs (not part of the repository)
+*.bin
+*.data
+*.root
+*.pkl
+*.npz
+*.pdf
+*.png
+*.log
+results/
+logs/
+
+# Python
+__pycache__/
+*.pyc
